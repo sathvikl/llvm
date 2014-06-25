@@ -15,8 +15,10 @@
 #include "llvm/Config/config.h"
 #include "llvm/ExecutionEngine/JITEventListener.h"
 
-#include "llvm/IR/DebugInfo.h"
+#define DEBUG_TYPE "oprofile-jit-event-listener"
+#include "llvm/DebugInfo.h"
 #include "llvm/IR/Function.h"
+#include "llvm/ADT/OwningPtr.h"
 #include "llvm/CodeGen/MachineFunction.h"
 #include "llvm/ExecutionEngine/ObjectImage.h"
 #include "llvm/ExecutionEngine/OProfileWrapper.h"
@@ -28,11 +30,16 @@
 
 #include <dirent.h>
 #include <fcntl.h>
+// JVMTISYM 
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+#include <stdlib.h>
+#define JVMTISYM_FILENAME "/tmp/jvmtisym_php.txt"
+static int fs2excel_defined = 0;  
 
 using namespace llvm;
 using namespace llvm::jitprofiling;
-
-#define DEBUG_TYPE "oprofile-jit-event-listener"
 
 namespace {
 
@@ -60,12 +67,26 @@ public:
   virtual void NotifyFreeingObject(const ObjectImage &Obj);
 };
 
+
+FILE *fwriter;
+
 void OProfileJITEventListener::initialize() {
   if (!Wrapper.op_open_agent()) {
     const std::string err_str = sys::StrError();
     DEBUG(dbgs() << "Failed to connect to OProfile agent: " << err_str << "\n");
   } else {
     DEBUG(dbgs() << "Connected to OProfile agent.\n");
+    //JVMTISYM file writer. 
+    if(getenv("FS2EXCEL") != NULL) { 
+      fs2excel_defined = 1; 
+      fwriter = fopen(JVMTISYM_FILENAME, "w+");
+      if(fwriter == NULL) {
+         perror("In OProfileJITEventListener::initialize() JVMTISYM_FILENAME file creation failed");
+      }
+      fprintf(fwriter, \
+              "IM initializing JVMTI\nPF Linux x86_64\nPI 0x%X\nIM JLocationFormat = JVMTI_JLOCATION_JVMBCI\nIM Init done\n\n", \
+              getpid());
+    }
   }
 }
 
@@ -79,8 +100,53 @@ OProfileJITEventListener::~OProfileJITEventListener() {
       DEBUG(dbgs() << "Disconnected from OProfile agent.\n");
     }
   }
+  /* Even if the OProfile deamon was shutdown prior to the end of the app, we still need the symbol map file */
+  if(fs2excel_defined && fwriter != NULL ) { 
+    fclose(fwriter); 
+  }
 }
 
+static int tot_written = 0;
+/** write jit compiled method code to symbol file. */
+static void writeMethodBytes( const uint8_t *bytes, uint64_t length) {
+  uint64_t count;
+
+  if (fwriter != NULL ) {
+    for (count = 0; count < length; ++count) {
+      if(count % 16 == 0)
+        tot_written += fprintf(fwriter, "\nMB");
+      if(count % 4 == 0)
+        tot_written += fprintf(fwriter, " ");
+     
+      tot_written += fprintf(fwriter, "%02X ", *bytes);
+      ++bytes;
+    }
+    tot_written += fprintf(fwriter, "\n");
+    fflush(fwriter); 
+  }
+}
+
+/** write a jmvtisym compiled method CM record and
+ *  write the method bytes. 
+ *  returns number of bytes written. */
+static int writeMethodInfo( const char *fname,  const uint64_t faddrs, uint64_t flen) {
+  int outbytes = 0;
+  long current_time = (uintmax_t)time(NULL);
+
+  if (fwriter != NULL ) {
+    //Write out compiled method and method bytes records
+    outbytes += fprintf(fwriter, \
+                        "CM 0x%016X 0x%016lX RUNTIME_CODE_GEN %s\n", \
+                            65537/*class ID*/, faddrs, fname);
+    outbytes += fprintf(fwriter, \
+                        "ML 0x%016lX 0x%016lX 0x%016lX %010ld 0x%04X 0x%04X", \
+                            faddrs/*addr as method ID*/, faddrs, flen, /*generated time*/current_time, 0/*bytecode to address map*/, 0/*source to bytecode map*/);
+    writeMethodBytes(reinterpret_cast<uint8_t*>(faddrs), flen);
+    fflush(fwriter); //incase close is neglected
+  }
+  return outbytes;
+}
+    
 static debug_line_info LineStartToOProfileFormat(
     const MachineFunction &MF, FilenameCache &Filenames,
     uintptr_t Address, DebugLoc Loc) {
@@ -98,6 +164,7 @@ static debug_line_info LineStartToOProfileFormat(
 void OProfileJITEventListener::NotifyFunctionEmitted(
     const Function &F, void *FnStart, size_t FnSize,
     const JITEvent_EmittedFunctionDetails &Details) {
+  
   assert(F.hasName() && FnStart != 0 && "Bad symbol to add");
   if (Wrapper.op_write_native_code(F.getName().data(),
                            reinterpret_cast<uint64_t>(FnStart),
@@ -169,10 +236,13 @@ void OProfileJITEventListener::NotifyObjectEmitted(const ObjectImage &Obj) {
   if (!Wrapper.isAgentAvailable()) {
     return;
   }
-
+ 
   // Use symbol info to iterate functions in the object.
-  for (object::symbol_iterator I = Obj.begin_symbols(), E = Obj.end_symbols();
-       I != E; ++I) {
+  error_code ec;
+  for (object::symbol_iterator I = Obj.begin_symbols(),
+                               E = Obj.end_symbols();
+                        I != E && !ec;
+                        I.increment(ec)) {
     object::SymbolRef::Type SymType;
     if (I->getType(SymType)) continue;
     if (SymType == object::SymbolRef::ST_Function) {
@@ -183,6 +253,13 @@ void OProfileJITEventListener::NotifyObjectEmitted(const ObjectImage &Obj) {
       if (I->getAddress(Addr)) continue;
       if (I->getSize(Size)) continue;
 
+      //JVMTISYM FS2Excel specific file writer 
+      if(fs2excel_defined) {
+        static int total_bytes = 0;
+        total_bytes += Size;
+        writeMethodInfo(Name.data(), Addr , Size); 
+        //fprintf(stderr, "Function name: %s, address: %lx, size: %ld total_size: %d written: %d\n", Name.data(), Addr, Size, total_bytes, tot_written);
+      }
       if (Wrapper.op_write_native_code(Name.data(), Addr, (void*)Addr, Size)
                         == -1) {
         DEBUG(dbgs() << "Failed to tell OProfile about native function "
@@ -201,8 +278,11 @@ void OProfileJITEventListener::NotifyFreeingObject(const ObjectImage &Obj) {
   }
 
   // Use symbol info to iterate functions in the object.
-  for (object::symbol_iterator I = Obj.begin_symbols(), E = Obj.end_symbols();
-       I != E; ++I) {
+  error_code ec;
+  for (object::symbol_iterator I = Obj.begin_symbols(),
+                               E = Obj.end_symbols();
+                        I != E && !ec;
+                        I.increment(ec)) {
     object::SymbolRef::Type SymType;
     if (I->getType(SymType)) continue;
     if (SymType == object::SymbolRef::ST_Function) {
@@ -223,8 +303,7 @@ void OProfileJITEventListener::NotifyFreeingObject(const ObjectImage &Obj) {
 
 namespace llvm {
 JITEventListener *JITEventListener::createOProfileJITEventListener() {
-  static std::unique_ptr<OProfileWrapper> JITProfilingWrapper(
-      new OProfileWrapper);
+  static OwningPtr<OProfileWrapper> JITProfilingWrapper(new OProfileWrapper);
   return new OProfileJITEventListener(*JITProfilingWrapper);
 }
 
@@ -235,4 +314,3 @@ JITEventListener *JITEventListener::createOProfileJITEventListener(
 }
 
 } // namespace llvm
-
